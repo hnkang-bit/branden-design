@@ -83,7 +83,13 @@
   }
   .search::placeholder { color: #7E878D; }
   .search:focus { outline: 2px solid #4C8F7C; outline-offset: -1px; }
-  .savestate { font-size: 12px; color: #8C959A; min-width: 62px; text-align: right; }
+  .barbtn {
+    background: #2E353A; border: 1px solid #3C444A; color: #C9D0D4;
+    border-radius: 3px; font: inherit; font-size: 12.5px; padding: 4px 9px; cursor: pointer;
+    white-space: nowrap;
+  }
+  .barbtn:hover { background: #394247; color: #EDEFEA; }
+  .savestate { font-size: 12px; color: #8C959A; min-width: 96px; text-align: right; }
 
   /* ── rail ──────────────────────────────────── */
   .rail {
@@ -462,7 +468,7 @@
   var saveTimer = null;
   var checkToken = 0;
 
-  /* ── storage ─────────────────────────────── */
+  /* ── storage: writes to every channel available ── */
 
   function seed() {
     return [{
@@ -476,51 +482,180 @@
     }];
   }
 
-  function load() {
-    if (!window.storage) {
-      state.products = seed();
-      state.selected = state.products[0].id;
-      render();
-      return;
+  var Store = {
+    hasClaude: !!(window.storage && window.storage.get),
+    hasLocal: (function () {
+      try {
+        window.localStorage.setItem("__probe", "1");
+        window.localStorage.removeItem("__probe");
+        return true;
+      } catch (e) { return false; }
+    })(),
+    where: function () {
+      if (this.hasLocal && this.hasClaude) return "브라우저 + Claude";
+      if (this.hasLocal) return "이 브라우저";
+      if (this.hasClaude) return "Claude";
+      return "저장 안 됨";
     }
-    window.storage.get(KEY).then(function (r) {
-      var parsed = r && r.value ? JSON.parse(r.value) : null;
-      state.products = (parsed && parsed.products && parsed.products.length) ? parsed.products : seed();
-      if (parsed && parsed.sideW) state.sideW = parsed.sideW;
-      if (parsed && typeof parsed.manOpen === "boolean") state.manOpen = parsed.manOpen;
+  };
+
+  function payload() {
+    return {
+      v: 1,
+      savedAt: Date.now(),
+      products: state.products,
+      sideW: state.sideW,
+      manOpen: state.manOpen
+    };
+  }
+
+  function apply(parsed) {
+    if (!parsed || !parsed.products || !parsed.products.length) return false;
+    state.products = parsed.products;
+    if (parsed.sideW) state.sideW = parsed.sideW;
+    if (typeof parsed.manOpen === "boolean") state.manOpen = parsed.manOpen;
+    return true;
+  }
+
+  function safeParse(raw) {
+    try { return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
+  }
+
+  function load() {
+    var found = [];
+
+    if (Store.hasLocal) {
+      var l = safeParse(window.localStorage.getItem(KEY));
+      if (l) found.push(l);
+    }
+
+    function finish() {
+      found.sort(function (a, b) { return (b.savedAt || 0) - (a.savedAt || 0); });
+      var ok = apply(found[0]);
+      if (!ok) {
+        state.products = seed();
+        state.selected = state.products[0].id;
+        render();
+        persist();
+        return;
+      }
       state.selected = state.products[0] ? state.products[0].id : null;
+      state.save = "불러옴";
       render();
-    }).catch(function () {
-      state.products = seed();
-      state.selected = state.products[0].id;
-      render();
-      persist();
-    });
+    }
+
+    if (!Store.hasClaude) { finish(); return; }
+
+    window.storage.get(KEY).then(function (r) {
+      var c = safeParse(r && r.value);
+      if (c) found.push(c);
+      finish();
+    }).catch(finish);
   }
 
   function persist() {
-    if (!window.storage) { state.save = "로컬 미저장"; paintSave(); return; }
-    state.save = "저장 중…";
+    var data = payload();
+    var text = JSON.stringify(data);
+    var wroteLocal = false;
+
+    if (Store.hasLocal) {
+      try {
+        window.localStorage.setItem(KEY, text);
+        wroteLocal = true;
+      } catch (e) {
+        state.save = "용량 초과";
+        paintSave();
+      }
+    }
+
+    if (Store.hasClaude) {
+      state.save = wroteLocal ? "저장됨" : "저장 중…";
+      paintSave();
+      window.storage.set(KEY, text).then(function () {
+        state.save = "저장됨";
+        paintSave();
+      }).catch(function () {
+        state.save = wroteLocal ? "저장됨 (브라우저)" : "저장 실패";
+        paintSave();
+      });
+      return;
+    }
+
+    state.save = wroteLocal ? "저장됨" : "저장 안 됨";
     paintSave();
-    window.storage.set(KEY, JSON.stringify({ products: state.products, sideW: state.sideW, manOpen: state.manOpen })).then(function () {
-      state.save = "저장됨";
-      paintSave();
-    }).catch(function () {
-      state.save = "저장 실패";
-      paintSave();
-    });
   }
 
   function queueSave() {
     state.save = "…";
     paintSave();
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(persist, 700);
+    saveTimer = setTimeout(persist, 600);
+  }
+
+  function flushSave() {
+    if (!saveTimer) return;
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    if (Store.hasLocal) {
+      try { window.localStorage.setItem(KEY, JSON.stringify(payload())); } catch (e) {}
+    }
+    if (Store.hasClaude) { try { window.storage.set(KEY, JSON.stringify(payload())); } catch (e) {} }
   }
 
   function paintSave() {
     var el = root.querySelector(".savestate");
-    if (el) el.textContent = state.save;
+    if (el) {
+      el.textContent = state.save;
+      el.title = "저장 위치: " + Store.where();
+    }
+  }
+
+  /* ── backup file in / out ────────────────── */
+
+  function exportFile() {
+    var stamp = new Date();
+    var pad = function (n) { return (n < 10 ? "0" : "") + n; };
+    var name = "detail-codes-" + stamp.getFullYear() + pad(stamp.getMonth() + 1) +
+      pad(stamp.getDate()) + "-" + pad(stamp.getHours()) + pad(stamp.getMinutes()) + ".json";
+    var blob = new Blob([JSON.stringify(payload(), null, 2)], { type: "application/json" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+  }
+
+  function importFile(file, mode) {
+    var fr = new FileReader();
+    fr.onload = function () {
+      var parsed = safeParse(fr.result);
+      if (!parsed || !parsed.products) {
+        state.save = "파일 형식 오류";
+        paintSave();
+        return;
+      }
+      if (mode === "replace") {
+        state.products = parsed.products;
+      } else {
+        var byId = {};
+        state.products.forEach(function (x) { byId[x.id] = x; });
+        parsed.products.forEach(function (x) {
+          var mine = byId[x.id];
+          if (!mine) { state.products.push(x); return; }
+          if ((x.updated || 0) > (mine.updated || 0)) {
+            for (var k in x) { if (Object.prototype.hasOwnProperty.call(x, k)) mine[k] = x[k]; }
+          }
+        });
+      }
+      state.selected = state.products[0] ? state.products[0].id : null;
+      state.save = "불러옴 " + parsed.products.length + "개";
+      render();
+      persist();
+    };
+    fr.readAsText(file);
   }
 
   /* ── helpers ─────────────────────────────── */
@@ -795,6 +930,9 @@
       '<span class="count">' + total + '개 제품</span>' +
       '<span class="spacer"></span>' +
       '<input class="search" type="search" placeholder="제품명 · 상품번호 · 파일명 검색" value="' + esc(state.query) + '">' +
+      '<button class="barbtn" data-act="export">백업 내려받기</button>' +
+      '<button class="barbtn" data-act="import">파일 불러오기</button>' +
+      '<input type="file" class="fileIn" accept=".json,application/json" hidden>' +
       '<span class="savestate">' + esc(state.save) + '</span>' +
       '</div>';
 
@@ -1043,6 +1181,21 @@
       });
     });
 
+    var fileIn = q(".fileIn");
+    if (fileIn) {
+      fileIn.addEventListener("change", function () {
+        var f = fileIn.files && fileIn.files[0];
+        if (!f) return;
+        var mode = window.confirm(
+          "확인을 누르면 기존 목록에 합칩니다.\n" +
+          "(같은 제품은 최근 수정본으로 갱신)\n\n" +
+          "취소를 누르면 파일 내용으로 전부 교체합니다."
+        ) ? "merge" : "replace";
+        importFile(f, mode);
+        fileIn.value = "";
+      });
+    }
+
     var handle = q(".drag");
     if (handle) {
       handle.addEventListener("mousedown", function (e) {
@@ -1124,6 +1277,15 @@
     root.querySelectorAll("[data-act]").forEach(function (b) {
       b.addEventListener("click", function () {
         var act = b.getAttribute("data-act");
+
+        if (act === "export") { flushSave(); exportFile(); return; }
+
+        if (act === "import") {
+          var fi0 = q(".fileIn");
+          if (fi0) fi0.click();
+          return;
+        }
+
         var p = cur();
         if (!p) return;
 
@@ -1195,6 +1357,11 @@
       }
     }
   }
+
+  window.addEventListener("beforeunload", flushSave);
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "hidden") flushSave();
+  });
 
   var fitTimer = null;
   window.addEventListener("resize", function () {
